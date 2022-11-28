@@ -33,14 +33,28 @@
 package net.ausiasmarch.wildcart.service;
 
 import javax.servlet.http.HttpSession;
+import javax.transaction.Transactional;
+
+import net.ausiasmarch.wildcart.bean.CaptchaBean;
+import net.ausiasmarch.wildcart.bean.TokenBean;
 import net.ausiasmarch.wildcart.bean.UsuarioBean;
+import net.ausiasmarch.wildcart.entity.PendentEntity;
+import net.ausiasmarch.wildcart.entity.QuestionEntity;
+import net.ausiasmarch.wildcart.exception.ResourceNotFoundException;
 import net.ausiasmarch.wildcart.exception.UnauthorizedException;
 import net.ausiasmarch.wildcart.entity.UsuarioEntity;
+import net.ausiasmarch.wildcart.helper.RandomHelper;
 import net.ausiasmarch.wildcart.helper.TipoUsuarioHelper;
+import net.ausiasmarch.wildcart.repository.PendentRepository;
+import net.ausiasmarch.wildcart.repository.QuestionRepository;
 import net.ausiasmarch.wildcart.repository.UsuarioRepository;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.web.bind.annotation.RequestBody;
+
+import java.time.LocalDateTime;
+import java.util.List;
 
 @Service
 public class AuthService {
@@ -50,6 +64,107 @@ public class AuthService {
 
     @Autowired
     UsuarioRepository oUsuarioRepository;
+
+    @Autowired
+    private QuestionRepository oQuestionRepository;
+
+    @Autowired
+    private PendentRepository oPendentRepository;
+
+    @Value("${captcha.timeout}")
+    private long captchaTimeout;
+
+    @Transactional
+    public TokenBean prelogin() {
+        deleteExpiredPendents();
+
+        PendentEntity oPendentEntity = new PendentEntity();
+
+        List<QuestionEntity> allQuestions = oQuestionRepository.findAll();
+        QuestionEntity randomQuestion = allQuestions.get(RandomHelper.getRandomInt(0, allQuestions.size() - 1));
+
+        LocalDateTime timecode = LocalDateTime.now();
+        oPendentEntity.setQuestion(randomQuestion);
+        oPendentEntity.setTimecode(timecode);
+        PendentEntity savedPendentEntity = oPendentRepository.save(oPendentEntity);
+
+        // Token parameters for generation
+        String timestamp = timecode.toString();
+        String n1 = String.valueOf(randomQuestion.getId());
+        String pendentEntityId = String.valueOf(savedPendentEntity.getId());
+        String randomNumber = String.valueOf(RandomHelper.getRandomInt(1, 9999));
+
+        String token = timestamp + n1 + pendentEntityId + randomNumber;
+        String hashedToken = RandomHelper.getSHA256(token);
+
+        savedPendentEntity.setToken(hashedToken);
+        oPendentRepository.save(savedPendentEntity);
+
+        TokenBean oTokenBean = new TokenBean();
+        oTokenBean.setToken(hashedToken);
+        oTokenBean.setStatement(savedPendentEntity.getQuestion().getStatement());
+
+        return oTokenBean;
+    }
+
+    public UsuarioEntity loginC(@RequestBody CaptchaBean oCaptchaBean) {
+        deleteExpiredPendents();
+
+        if (oCaptchaBean.getPassword() != null) {
+            UsuarioEntity oUsuarioEntity = oUsuarioRepository.findByLoginAndPassword(oCaptchaBean.getLogin(), oCaptchaBean.getPassword());
+            if (oUsuarioEntity != null) {
+                String token = oCaptchaBean.getToken();
+                String captchaResponse = oCaptchaBean.getResponse();
+
+                PendentEntity oPendentEntity = oPendentRepository.findByToken(token)
+                        .orElseThrow(() -> new ResourceNotFoundException("Pendent with token " + token + " not found"));
+
+                QuestionEntity oQuestionEntity = oPendentEntity.getQuestion();
+                String answer = oQuestionEntity.getResponse();
+
+                LocalDateTime requestTime = LocalDateTime.now();
+                LocalDateTime timecode = oPendentEntity.getTimecode();
+
+                if (requestTime.isAfter(timecode.plusSeconds(captchaTimeout))) {
+                    throw new UnauthorizedException("Timecode expired");
+                }
+
+                if (answer.contains("|")) {
+                    String[] answers = answer.split("\\|");
+                    for (String a : answers) {
+                        if (a.equals(captchaResponse)) {
+                            oPendentRepository.delete(oPendentEntity);
+                            oHttpSession.setAttribute("usuario", oUsuarioEntity);
+                            return oUsuarioEntity;
+                        }
+                    }
+                }
+
+                if (answer.equals(captchaResponse)) {
+                    oHttpSession.setAttribute("usuario", oUsuarioEntity);
+                    oPendentRepository.delete(oPendentEntity);
+                    return oUsuarioEntity;
+                } else {
+                    throw new UnauthorizedException("wrong captcha");
+                }
+            } else {
+                throw new UnauthorizedException("login or password incorrect");
+            }
+        } else {
+            throw new UnauthorizedException("wrong password");
+        }
+    }
+
+    private void deleteExpiredPendents() {
+        List<PendentEntity> allPendents = oPendentRepository.findAll();
+        LocalDateTime now = LocalDateTime.now();
+
+        allPendents.forEach((oPendentEntity) -> {
+            if (oPendentEntity.getTimecode().plusSeconds(captchaTimeout).isBefore(now)) {
+                oPendentRepository.delete(oPendentEntity);
+            }
+        });
+    }
 
     public UsuarioEntity login(@RequestBody UsuarioBean oUsuarioBean) {
         if (oUsuarioBean.getPassword() != null) {
